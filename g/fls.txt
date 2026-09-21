@@ -1,0 +1,24 @@
+mkdir MAIN_NOTEBOOK_DESIGN
+cd MAIN_NOTEBOOK_DESIGN
+
+mkdir _lib sample_data workflows
+
+type nul > _lib\audit.py
+type nul > _lib\auth.py
+type nul > _lib\http_client.py
+type nul > _lib\landing_writer.py
+type nul > _lib\logging_utils.py
+type nul > _lib\paginators.py
+
+type nul > sample_data\insert_ingestion_config.sql
+
+type nul > workflows\ingestion_ADO_BOARDS_WORKITEMS.json
+type nul > workflows\ingestion_GITHUB_REPOSITORIES.json
+type nul > workflows\ingestion_SNOW_INCIDENTS.json
+
+type nul > 01_Entity_Extractor.py
+type nul > DDL.sql
+type nul > ingestion_workflow.json
+
+
+
