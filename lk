@@ -1,0 +1,13 @@
+SELECT 
+    t.Id, -- Replace with your Primary Key column
+    '{' + STRING_AGG(
+        -- Re-construct key-value pair as JSON string
+        CAST('"' + parsed.[key] + '":' + REPLACE(parsed.[value], '"Key Result"', '"xyz"') AS NVARCHAR(MAX)),
+        ','
+    ) WITHIN GROUP (
+        -- Sort numerically by extracting the number from 'task_N'
+        ORDER BY CAST(SUBSTRING(parsed.[key], CHARINDEX('_', parsed.[key]) + 1, 10) AS INT)
+    ) + '}' AS task_defination_sorted_and_replaced
+FROM YourTable t
+CROSS APPLY OPENJSON(t.task_defination) parsed
+GROUP BY t.Id;
