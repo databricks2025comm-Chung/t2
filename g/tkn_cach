@@ -1,0 +1,31 @@
+from pyspark.sql import Row
+from pyspark.sql.functions import base64, expr, unbase64
+
+# Sample data
+data = [
+    Row(id=1, name="Alice", ssn="123-45-6789"),
+    Row(id=2, name="Bob", ssn="987-65-4321"),
+    Row(id=3, name="Charlie", ssn="123-45-6789"),
+]
+df = spark.createDataFrame(data)
+
+# FIX: Use a key that is strictly 32 bytes long (32 ASCII characters)
+# encryption_key = "12345678901234567890123456789012"  # Exactly 32 bytes
+encryption_key = key_string  # Exactly 32 bytes
+
+print("--- GCM MODE WITH CORRECT KEY LENGTH ---")
+df_gcm = df.withColumn(
+    "ssn_gcm", base64(expr(f"aes_encrypt(ssn, '{encryption_key}', 'GCM')"))
+)
+
+df_gcm.select("id", "name", "ssn", "ssn_gcm").show(truncate=False)
+
+# Decrypting successfully
+df_decrypted = df_gcm.withColumn(
+    "ssn_restored",
+    expr(
+        f"cast(aes_decrypt(unbase64(ssn_gcm), '{encryption_key}', 'GCM') as string)"
+    ),
+)
+
+df_decrypted.select("id", "name", "ssn_restored").show(truncate=False)
