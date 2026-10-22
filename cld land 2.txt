@@ -1,0 +1,255 @@
+# Databricks notebook source
+
+# COMMAND ----------
+from collections import namedtuple as _namedtuple
+import datetime                     as _datetime
+import io                           as _io
+import itertools                    as _itertools
+import json                         as _json
+import os                           as _os
+import time                         as _time
+import uuid                         as _uuid
+
+_TARGET_FILE_MB  = 128
+_SAMPLE_MAX      = 100   # records used to estimate average record size
+_ORPHAN_AGE_SECS = 300   # fallback age threshold when no .pid file exists
+_RUN_TS          = _datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+
+_WriteResult = _namedtuple("_WriteResult", ["total", "max_watermark"])
+
+# COMMAND ----------
+
+
+class _Chunk:
+    """Mutable state for the currently-open output chunk."""
+    __slots__ = ("fh", "tmp", "dest", "num", "pid_file")
+
+    def __init__(self):
+        self.fh       = None
+        self.tmp      = None
+        self.dest     = None
+        self.num      = 0
+        self.pid_file = None
+
+    @property
+    def is_open(self) -> bool:
+        return self.fh is not None
+
+
+def _open_chunk(chunk: "_Chunk", base_dir: str, file_name: "str | None") -> None:
+    chunk.num += 1
+    if file_name:
+        if "." in file_name:
+            stem, ext = file_name.rsplit(".", 1)
+            fname = f"{stem}_chunk_{chunk.num}_{_RUN_TS}.{ext}"
+        else:
+            fname = f"{file_name}_chunk_{chunk.num}_{_RUN_TS}"
+    else:
+        fname = f"chunk_{chunk.num}_{_RUN_TS}.json"
+    chunk.dest     = f"{base_dir}/{fname}"
+    chunk.tmp      = f"{chunk.dest}.{_uuid.uuid4().hex}.tmp"
+    chunk.pid_file = f"{chunk.tmp}.pid"
+    chunk.fh       = open(chunk.tmp, "w", encoding="utf-8")
+    with open(chunk.pid_file, "w") as _pf:
+        _pf.write(str(_os.getpid()))
+
+
+def _seal_chunk(chunk: "_Chunk", chunk_paths: list, log: "ContextLogger") -> None:
+    chunk.fh.flush()
+    _os.fsync(chunk.fh.fileno())   # flush kernel + FUSE buffers before rename
+    chunk.fh.close()
+    _os.replace(chunk.tmp, chunk.dest)
+    chunk_paths.append(chunk.dest)
+    try:
+        _os.unlink(chunk.pid_file)
+    except OSError:
+        pass
+    log.debug(f"Chunk sealed  chunk={chunk.num}  path={chunk.dest}")
+    chunk.fh = chunk.tmp = chunk.dest = chunk.pid_file = None
+
+
+# COMMAND ----------
+
+
+def write_pages_to_json(
+    page_iter,
+    landing_path:         str,
+    log:                  "ContextLogger",
+    file_name:            str  = None,
+    write_success_marker: bool = False,
+    target_file_mb:       int  = _TARGET_FILE_MB,
+) -> "_WriteResult":
+    """
+    Consume the page generator, write records to JSONL in size-capped files
+    via Python I/O.  Works for any path the driver can open() — /Volumes/, /dbfs/.
+
+    Chunk size is derived once from the first batch: up to _SAMPLE_MAX records
+    are serialised to measure average bytes per record, then records_per_chunk
+    is computed so each file is approximately target_file_mb MB.
+
+    Args:
+        page_iter:            Generator from a PAGINATION_DISPATCH handler.
+        landing_path:         Destination directory.  Created if it does not exist.
+        log:                  ContextLogger from logging_utils.
+        file_name:            Optional controlled output name.  See header doc for naming rules.
+        write_success_marker: When True, writes an empty _SUCCESS file after all
+                              chunks are done.  Default False.
+        target_file_mb:       Target output file size in MB.  Default 128.
+
+    Returns:
+        _WriteResult(total, max_watermark=None)
+
+    Raises:
+        OSError: if the directory cannot be created or a file cannot be written.
+    """
+    _dir = landing_path.rstrip("/")
+    _os.makedirs(_dir, exist_ok=True)
+
+    # Remove orphaned .tmp files from a previous crashed run.
+    # Primary check: read the companion .pid file and probe the PID with os.kill(pid, 0).
+    #   ProcessLookupError → PID is dead → orphan, safe to delete.
+    #   PermissionError    → PID is alive (different user) → skip.
+    # Fallback (no .pid file): age-based check using mtime.
+    for _f in _os.listdir(_dir):
+        if not _f.endswith(".tmp"):
+            continue
+        _path    = f"{_dir}/{_f}"
+        _pidpath = f"{_path}.pid"
+        _orphan  = False
+        try:
+            with open(_pidpath) as _pf:
+                _pid = int(_pf.read().strip())
+            try:
+                _os.kill(_pid, 0)          # signal 0 = liveness probe, no signal sent
+            except ProcessLookupError:
+                _orphan = True             # PID dead → orphan
+            except PermissionError:
+                pass                       # PID alive, different user → skip
+        except (OSError, ValueError):
+            # No .pid file (old-style .tmp) → fall back to mtime age check
+            try:
+                _orphan = _time.time() - _os.path.getmtime(_path) > _ORPHAN_AGE_SECS
+            except OSError:
+                pass
+        if _orphan:
+            for _p in (_path, _pidpath):
+                try:
+                    _os.unlink(_p)
+                except OSError:
+                    pass
+            log.debug(f"Removed orphaned .tmp  path={_path}")
+
+    # Second pass: remove .pid files whose paired .tmp no longer exists.
+    for _f in _os.listdir(_dir):
+        if _f.endswith(".tmp.pid"):
+            _pidpath = f"{_dir}/{_f}"
+            _tmppath = _pidpath[:-4]       # strip ".pid"
+            if not _os.path.exists(_tmppath):
+                try:
+                    _os.unlink(_pidpath)
+                except OSError:
+                    pass
+
+    target_bytes = target_file_mb * 1024 * 1024
+
+    # ── Peek first batch ──────────────────────────────────────────────
+    try:
+        first_batch = next(iter(page_iter))
+    except StopIteration:
+        log.info("No records returned by API — landing zone not written")
+        return _WriteResult(total=0, max_watermark=None)
+
+    # ── Sample to estimate avg record size ────────────────────────────
+    sample = first_batch[:_SAMPLE_MAX]
+    if sample:
+        # --- OLD: sized the sample as one JSON array ---
+        # _buf = _io.StringIO()
+        # _json.dump(sample, _buf, default=str)
+        # avg_bytes         = len(_buf.getvalue().encode("utf-8")) / len(sample)
+        # --- NEW: size each record as its own JSONL line ---
+        avg_bytes = sum(
+            len(_json.dumps(_r, default=str).encode("utf-8")) + 1   # +1 for "\n"
+            for _r in sample
+        ) / len(sample)
+        records_per_chunk = max(1, int(target_bytes / avg_bytes))
+    else:
+        avg_bytes         = 0
+        records_per_chunk = 50_000   # fallback: first batch was empty
+
+    log.debug(
+        f"Record size sampled  sample={len(sample)}"
+        f"  avg_bytes={avg_bytes:.0f}"
+        f"  records_per_chunk={records_per_chunk}"
+    )
+
+    chunk         = _Chunk()
+    chunk_records = 0
+    total         = 0
+    chunk_paths   = []
+
+    try:
+        for page_num, batch in enumerate(_itertools.chain([first_batch], page_iter)):
+            if not batch:
+                continue
+            if not chunk.is_open:
+                _open_chunk(chunk, _dir, file_name)
+
+            # --- OLD: wrote the whole page as ONE JSON array per line ---
+            # _json.dump(batch, chunk.fh, default=str)
+            # chunk.fh.write("\n")
+            # --- NEW: JSONL, one record per line ---
+            for _rec in batch:
+                _json.dump(_rec, chunk.fh, default=str)
+                chunk.fh.write("\n")
+            chunk_records += len(batch)
+            total         += len(batch)
+
+            if chunk_records >= records_per_chunk:
+                _seal_chunk(chunk, chunk_paths, log)
+                chunk_records = 0
+
+            log.debug(
+                f"Page written  page={page_num + 1}"
+                f"  size={len(batch)}"
+                f"  total={total}"
+            )
+
+        if chunk.is_open:
+            _seal_chunk(chunk, chunk_paths, log)
+
+    except Exception:
+        if chunk.is_open:
+            try:
+                chunk.fh.close()
+            except OSError:
+                pass
+            for _p in (chunk.tmp, chunk.pid_file):
+                if _p:
+                    try:
+                        _os.unlink(_p)
+                    except OSError:
+                        pass
+        raise
+
+    if total == 0:
+        log.info("No records returned by API — landing zone not written")
+        return _WriteResult(total=0, max_watermark=None)
+
+    if file_name and len(chunk_paths) == 1:
+        final = f"{_dir}/{file_name}"
+        _os.replace(chunk_paths[0], final)
+        log.debug(f"Single chunk renamed  {chunk_paths[0]} → {final}")
+
+    if write_success_marker:
+        with open(f"{_dir}/_SUCCESS", "w") as fh:
+            pass
+        log.debug(f"_SUCCESS marker written  path={_dir}/_SUCCESS")
+
+    log.info(
+        f"JSON write complete (Python I/O)"
+        f"  records={total}"
+        f"  chunks={chunk.num}"
+        f"  path={landing_path}"
+        + (f"  file_name={file_name}" if file_name else "")
+    )
+    return _WriteResult(total=total, max_watermark=None)
