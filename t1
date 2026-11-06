@@ -1,0 +1,18 @@
+1.	Primary key
+2.	Schema ahead
+3.	dedup rownumber
+4.	Idempotency Merge
+5.	Corrupted records (dead letters)
+6.	logging
+7.	No of topics, enttiies (datasets)
+8.	1 min for bronze, 5 min for others.
+9.	Event hub (T_1, T_2, micro batch streams topics)  >1  intermedia stream used in every other micro batch or stagged one to fan out.
+10.	Metadata tables for Connections for read and for write
+11.	1 fail all stops? loose dependency
+12.	Widget params
+13.	bronze tbl structure
+14.	UDF (Dead Vs Parse) ? Corrupted data filter to dead letter
+15.	struct parsing, flatten, array ?
+16.	any extra ETL
+17) for each batch if any.
+
